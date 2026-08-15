@@ -2,17 +2,17 @@ import socket
 import struct
 import threading
 import select
-import time
+import os
+import logging
 
 # =========================
 # CONFIGURATION
 # =========================
 
-HOST = "0.0.0.0"
-PORT = 1080
-
-USERNAME = "alex"
-PASSWORD = "change-this-password"
+HOST = os.environ.get("SOCKS5_HOST", "::")          # Use "::" for dual-stack, "0.0.0.0" for IPv4 only
+PORT = int(os.environ.get("SOCKS5_PORT", "1080"))
+USERNAME = os.environ.get("SOCKS5_USERNAME", "alex")
+PASSWORD = os.environ.get("SOCKS5_PASSWORD", "change-this-password")
 
 BUFFER_SIZE = 65536
 CONNECTION_TIMEOUT = 15
@@ -21,475 +21,352 @@ MAX_CONNECTIONS = 100
 active_connections = 0
 connection_lock = threading.Lock()
 
-
 # =========================
 # LOGGING
 # =========================
 
-def log(message):
-    print(f"[SOCKS5] {message}", flush=True)
-
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+log = logging.info
 
 # =========================
-# SEND SOCKS5 RESPONSE
+# HELPER: RECEIVE EXACTLY N BYTES
 # =========================
+
+def recv_exact(sock, length):
+    """Receive exactly `length` bytes from socket, handling partial reads."""
+    data = b""
+    while len(data) < length:
+        try:
+            chunk = sock.recv(length - len(data))
+        except socket.timeout:
+            return None
+        except Exception:
+            return None
+        if not chunk:
+            return None
+        data += chunk
+    return data
+
+# =========================
+# BUILD SOCKS5 RESPONSE
+# =========================
+
+def build_response(reply, address="0.0.0.0", port=0):
+    """Construct a SOCKS5 response packet, supporting IPv4 and IPv6."""
+    try:
+        ip_bytes = socket.inet_pton(socket.AF_INET, address)
+        atyp = 0x01
+    except OSError:
+        try:
+            ip_bytes = socket.inet_pton(socket.AF_INET6, address)
+            atyp = 0x04
+        except OSError:
+            ip_bytes = b"\x00\x00\x00\x00"
+            atyp = 0x01
+    return b"\x05" + bytes([reply]) + b"\x00" + bytes([atyp]) + ip_bytes + struct.pack("!H", port)
 
 def socks_response(client, reply, address="0.0.0.0", port=0):
+    """Send a SOCKS5 response to the client."""
     try:
-        ip = socket.inet_aton(address)
-
-        response = (
-            b"\x05" +
-            bytes([reply]) +
-            b"\x00" +
-            b"\x01" +
-            ip +
-            struct.pack("!H", port)
-        )
-
-        client.sendall(response)
-
+        client.sendall(build_response(reply, address, port))
     except Exception:
         pass
 
-
 # =========================
-# AUTHENTICATION
+# AUTHENTICATION (RFC 1929)
 # =========================
 
 def authenticate(client):
-
-    # Username/password authentication
-    #
-    # RFC 1929:
-    #
-    #  +----+------+----------+------+----------+
-    #  |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
-    #  +----+------+----------+------+----------+
-
-    data = client.recv(2)
-
-    if len(data) != 2:
+    # Read version and username length
+    header = recv_exact(client, 2)
+    if header is None:
         return False
-
-    version = data[0]
-    username_length = data[1]
+    version, ulen = header[0], header[1]
 
     if version != 1:
+        client.sendall(b"\x01\x01")
         return False
 
-    username = client.recv(username_length)
-
-    if len(username) != username_length:
+    # Read username
+    username = recv_exact(client, ulen)
+    if username is None:
         return False
 
-    password_length_data = client.recv(1)
-
-    if len(password_length_data) != 1:
+    # Read password length
+    plen_data = recv_exact(client, 1)
+    if plen_data is None:
         return False
+    plen = plen_data[0]
 
-    password_length = password_length_data[0]
-
-    password = client.recv(password_length)
-
-    if len(password) != password_length:
+    # Read password
+    password = recv_exact(client, plen)
+    if password is None:
         return False
 
     username = username.decode("utf-8", errors="ignore")
     password = password.decode("utf-8", errors="ignore")
 
     if username == USERNAME and password == PASSWORD:
-
         client.sendall(b"\x01\x00")
-
         return True
 
     client.sendall(b"\x01\x01")
-
     return False
-
 
 # =========================
 # SOCKS5 HANDSHAKE
 # =========================
 
 def handshake(client):
-
-    # Client sends:
-    #
-    # VER
-    # NMETHODS
-    # METHODS
-
-    header = client.recv(2)
-
-    if len(header) != 2:
+    # Read VER and NMETHODS
+    header = recv_exact(client, 2)
+    if header is None:
         return False
-
-    version = header[0]
-    method_count = header[1]
+    version, nmethods = header[0], header[1]
 
     if version != 5:
         return False
 
-    methods = client.recv(method_count)
-
-    if len(methods) != method_count:
+    # Read offered methods
+    methods = recv_exact(client, nmethods)
+    if methods is None:
         return False
 
-    # Require username/password authentication
+    # Require username/password authentication (0x02)
     if 0x02 not in methods:
-
-        # 0xFF = no acceptable methods
         client.sendall(b"\x05\xff")
-
         return False
 
     # Select username/password authentication
     client.sendall(b"\x05\x02")
-
     return authenticate(client)
 
-
 # =========================
-# READ DESTINATION
+# READ DESTINATION REQUEST
 # =========================
 
 def read_destination(client):
+    # Read VER, CMD, RSV, ATYP
+    header = recv_exact(client, 4)
+    if header is None:
+        return None
+    version, command, rsv, atyp = header[0], header[1], header[2], header[3]
 
-    # Request:
-    #
-    # VER
-    # CMD
-    # RSV
-    # ATYP
-    # DST.ADDR
-    # DST.PORT
-
-    header = client.recv(4)
-
-    if len(header) != 4:
+    if version != 5 or rsv != 0:
+        socks_response(client, 0x01)  # General failure
         return None
 
-    version = header[0]
-    command = header[1]
-    address_type = header[3]
-
-    if version != 5:
+    # Only CONNECT command is supported
+    if command != 0x01:
+        socks_response(client, 0x07)  # Command not supported
         return None
 
-    # Only CONNECT supported
-    if command != 1:
-        socks_response(client, 0x07)
-        return None
-
-    # IPv4
-    if address_type == 1:
-
-        data = client.recv(4)
-
-        if len(data) != 4:
+    # Parse address based on address type
+    if atyp == 0x01:  # IPv4
+        data = recv_exact(client, 4)
+        if data is None:
             return None
+        address = socket.inet_ntop(socket.AF_INET, data)
 
-        address = socket.inet_ntoa(data)
-
-    # Domain name
-    elif address_type == 3:
-
-        length_data = client.recv(1)
-
-        if len(length_data) != 1:
+    elif atyp == 0x03:  # Domain name
+        len_data = recv_exact(client, 1)
+        if len_data is None:
             return None
-
-        length = length_data[0]
-
-        domain = client.recv(length)
-
-        if len(domain) != length:
+        length = len_data[0]
+        domain = recv_exact(client, length)
+        if domain is None:
             return None
-
         address = domain.decode("utf-8", errors="ignore")
 
-    # IPv6
-    elif address_type == 4:
-
-        data = client.recv(16)
-
-        if len(data) != 16:
+    elif atyp == 0x04:  # IPv6
+        data = recv_exact(client, 16)
+        if data is None:
             return None
-
-        address = socket.inet_ntop(
-            socket.AF_INET6,
-            data
-        )
+        address = socket.inet_ntop(socket.AF_INET6, data)
 
     else:
-        socks_response(client, 0x08)
+        socks_response(client, 0x08)  # Address type not supported
         return None
 
-    port_data = client.recv(2)
-
-    if len(port_data) != 2:
+    # Read port
+    port_data = recv_exact(client, 2)
+    if port_data is None:
         return None
-
     port = struct.unpack("!H", port_data)[0]
 
     return address, port
-
 
 # =========================
 # CONNECT TO DESTINATION
 # =========================
 
 def connect_destination(address, port):
-
     try:
-
-        destination = socket.create_connection(
-            (address, port),
-            timeout=CONNECTION_TIMEOUT
-        )
-
-        destination.settimeout(None)
-
+        destination = socket.create_connection((address, port), timeout=CONNECTION_TIMEOUT)
+        destination.settimeout(None)  # Disable timeout for relay
         return destination
-
     except Exception as error:
-
         log(f"Connection failed: {address}:{port} ({error})")
-
         return None
 
-
 # =========================
-# RELAY DATA
+# RELAY DATA (BIDIRECTIONAL)
 # =========================
 
 def relay(client, destination):
-
     sockets = [client, destination]
-
     while True:
-
         try:
-
-            readable, _, exceptional = select.select(
-                sockets,
-                [],
-                sockets,
-                60
-            )
-
+            readable, _, exceptional = select.select(sockets, [], sockets)
             if exceptional:
                 break
-
-            if not readable:
-                break
-
             for source in readable:
-
                 data = source.recv(BUFFER_SIZE)
-
                 if not data:
-                    return
-
+                    return  # Connection closed by peer
                 if source is client:
                     destination.sendall(data)
-
                 else:
                     client.sendall(data)
-
-        except Exception:
+        except (socket.error, OSError):
             break
 
-
 # =========================
-# HANDLE CLIENT
+# HANDLE CLIENT CONNECTION
 # =========================
 
 def handle_client(client, address):
-
     global active_connections
 
     with connection_lock:
-
         active_connections += 1
-
     log(f"Client connected: {address}")
 
     destination = None
-
     try:
-
         client.settimeout(CONNECTION_TIMEOUT)
 
         # SOCKS5 negotiation
         if not handshake(client):
-
             log(f"Authentication failed: {address}")
-
             return
-
         log(f"Authenticated: {address}")
 
-        # Get requested destination
+        # Read requested destination
         target = read_destination(client)
-
         if not target:
             return
-
-        destination_host, destination_port = target
-
-        log(
-            f"{address} -> "
-            f"{destination_host}:{destination_port}"
-        )
+        dest_host, dest_port = target
+        log(f"{address} -> {dest_host}:{dest_port}")
 
         # Connect to destination
-        destination = connect_destination(
-            destination_host,
-            destination_port
-        )
-
+        destination = connect_destination(dest_host, dest_port)
         if destination is None:
-
-            socks_response(
-                client,
-                0x05
-            )
-
+            socks_response(client, 0x05)  # Connection refused
             return
 
-        # Tell SOCKS5 client connection succeeded
-        local_address = destination.getsockname()
+        # Send success response with the actual local bind address
+        local_ip, local_port = destination.getsockname()
+        socks_response(client, 0x00, local_ip, local_port)
 
-        socks_response(
-            client,
-            0x00,
-            local_address[0],
-            local_address[1]
-        )
-
-        # Relay data
+        # Disable timeout for relay
         client.settimeout(None)
-
-        relay(
-            client,
-            destination
-        )
+        relay(client, destination)
 
     except Exception as error:
-
-        log(
-            f"Client error {address}: {error}"
-        )
-
+        log(f"Client error {address}: {error}")
     finally:
-
         try:
             client.close()
-        except:
+        except Exception:
             pass
-
         if destination:
-
             try:
                 destination.close()
-            except:
+            except Exception:
                 pass
-
         with connection_lock:
             active_connections -= 1
-
         log(f"Client disconnected: {address}")
 
+# =========================
+# CREATE SERVER SOCKET (IPv6 dual-stack with IPv4 fallback)
+# =========================
+
+def create_server_socket(host, port):
+    # Attempt IPv6 dual-stack if host is IPv6 or unspecified
+    if ':' in host or host in ('', '::'):
+        try:
+            server = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+            server.bind((host if host else '::', port))
+            server.listen(100)
+            return server
+        except (OSError, socket.error) as e:
+            server.close()
+            if host in ('', '::'):
+                log(f"IPv6 bind failed: {e}, falling back to IPv4")
+            else:
+                raise
+
+    # IPv4 only or fallback
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    bind_host = '0.0.0.0' if host in ('', '::') else host
+    server.bind((bind_host, port))
+    server.listen(100)
+    return server
 
 # =========================
 # START SERVER
 # =========================
 
 def start_server():
-
     global active_connections
 
-    server = socket.socket(
-        socket.AF_INET6,
-        socket.SOCK_STREAM
-    )
+    try:
+        server = create_server_socket(HOST, PORT)
+    except Exception as error:
+        log(f"Failed to start server: {error}")
+        return
 
-    server.setsockopt(
-        socket.SOL_SOCKET,
-        socket.SO_REUSEADDR,
-        1
-    )
+    log(f"SOCKS5 server listening on {HOST}:{PORT}")
+    log(f"Username: {USERNAME}")
 
-    # Allow IPv4 connections too
-    server.setsockopt(
-        socket.IPPROTO_IPV6,
-        socket.IPV6_V6ONLY,
-        0
-    )
+    try:
+        while True:
+            try:
+                client, address = server.accept()
 
-    server.bind(
-        (HOST, PORT)
-    )
+                with connection_lock:
+                    if active_connections >= MAX_CONNECTIONS:
+                        log(f"Connection limit reached: {address}")
+                        client.close()
+                        continue
 
-    server.listen(100)
+                thread = threading.Thread(
+                    target=handle_client,
+                    args=(client, address),
+                    daemon=True
+                )
+                thread.start()
 
-    log(
-        f"SOCKS5 server listening on "
-        f"{HOST}:{PORT}"
-    )
-
-    log(
-        f"Username: {USERNAME}"
-    )
-
-    while True:
-
-        try:
-
-            client, address = server.accept()
-
-            with connection_lock:
-
-                if active_connections >= MAX_CONNECTIONS:
-
-                    log(
-                        f"Connection limit reached: {address}"
-                    )
-
-                    client.close()
-
-                    continue
-
-            thread = threading.Thread(
-                target=handle_client,
-                args=(client, address),
-                daemon=True
-            )
-
-            thread.start()
-
-        except KeyboardInterrupt:
-
-            log("Server shutting down")
-
-            server.close()
-
-            break
-
-        except Exception as error:
-
-            log(
-                f"Server error: {error}"
-            )
-
+            except KeyboardInterrupt:
+                log("Server shutting down")
+                break
+            except Exception as error:
+                log(f"Server error: {error}")
+    finally:
+        server.close()
 
 # =========================
 # MAIN
 # =========================
 
 if __name__ == "__main__":
-
     start_server()
